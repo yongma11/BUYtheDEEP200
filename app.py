@@ -1,4 +1,4 @@
-# 파일명: app.py
+# 파일명: ddulsa200_app.py  (배포 시 app.py 로 바꿔도 됨)
 # ============================================================================
 #  떨사 200 (Ddulsa 200) — 마스터 v1.0
 # ----------------------------------------------------------------------------
@@ -80,17 +80,24 @@ def max_slots_for(mode):   return MAX_SLOTS.get(mode, 5)
 # ============================================================================
 #  저장소 설정 (동파법과 분리된 파일명 — 원하면 동일 파일명으로 바꿔 공유 가능)
 # ============================================================================
-try:
-    GH_TOKEN = st.secrets["general"]["GH_TOKEN"]
-except Exception:
-    GH_TOKEN = None
-REPO_KEY      = "yongma11/dongpa6"
+def _secret(section, key, default=None):
+    """st.secrets[section][key] 안전 조회 (없으면 default)."""
+    try:
+        return st.secrets[section][key]
+    except Exception:
+        return default
+
+# GitHub (실전 트레이딩 저장용) — 없으면 백테스트만 동작
+GH_TOKEN      = _secret("general", "GH_TOKEN")                 # Personal Access Token
+REPO_KEY      = _secret("general", "REPO_KEY", "yongma11/dongpa6")  # ← 본인 새 repo 로 설정
 HOLDINGS_FILE = "ddulsa200_holdings.csv"
 JOURNAL_FILE  = "ddulsa200_journal.csv"
 EQUITY_FILE   = "ddulsa200_equity.csv"
 SETTINGS_FILE = "ddulsa200_settings.json"
-SPREADSHEET_ID        = "1s8XX-8PUAWyWOHOwst2W-b99pQo1_aFtLVg5uTD_HMI"
-WITHDRAWAL_SHEET_NAME = "TaxWithdrawals_DDULSA200"
+# Google Sheets (양도세/재기자본 인출용, 선택)
+SPREADSHEET_ID        = _secret("general", "SPREADSHEET_ID",
+                                "1s8XX-8PUAWyWOHOwst2W-b99pQo1_aFtLVg5uTD_HMI")
+WITHDRAWAL_SHEET_NAME = _secret("general", "WITHDRAWAL_SHEET_NAME", "TaxWithdrawals_DDULSA200")
 
 def get_now_kst():
     return datetime.utcnow() + timedelta(hours=9)
