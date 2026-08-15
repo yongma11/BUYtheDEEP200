@@ -1,0 +1,781 @@
+# 파일명: dolpa_bot.py
+# ============================================================================
+#  돌파공(突破攻) 텔레그램 봇 v1.0
+# ----------------------------------------------------------------------------
+#  전략 (SOXL 당일 돌파 + ATR30%/MA30 하방필터)
+#    매수 : 당일 고가 >= 당일시가 × 1.015  →  시가×1.015에 진입 (전액)
+#    매도 : 익일 시가에 전량 청산 (보유기간 항상 1거래일)
+#    필터 : 전일 ATR30% >= 최근 252거래일 ATR30%의 70%분위
+#           AND 전일종가 < 전일MA30   →  당일 신규매수 스킵
+#
+#  설계 원칙 — 동파공 봇과 다른 점
+#    · 포지션이 0 또는 1뿐이고 보유기간이 1거래일이라, 슬롯 재생이 필요없다.
+#      상태파일(state.json)에 보유 여부만 들고 다니며, 체결은 버튼으로 확인받는다.
+#      → 한투 API 없이도 완결된다. (API는 나중에 '잔고 대조'용으로만 붙이면 됨)
+#    · 동파공의 get_data()는 _freeze()로 당일 미완성봉을 잘라내지만,
+#      돌파공은 그 반대로 '당일 시가'가 필요하다. 그래서 일봉(지표용)과
+#      1분봉(당일 시가용)을 분리해서 받는다.
+#
+#  하루 3회 발송
+#    ① 개장 30분 전 : 필터 판정 (전일 데이터로 확정 — 시가와 무관)
+#    ② 개장 +2분    : 시가 확정 → 트리거가 계산 / 보유중이면 시가매도 안내
+#                      (필터 스킵일이고 보유도 없으면 발송하지 않는다)
+#    ③ 마감 후      : 체결 확인 요청 → 버튼으로 상태 갱신
+#
+#  ⚠️ MOO·스탑주문을 쓸 수 없는 환경이라 손매매가 전제다.
+#     ②번 알림을 받고 직접 감시·주문해야 한다.
+#
+#  실행: python dolpa_bot.py          (상시 구동 — 스케줄 + 버튼 폴링 동시)
+#        python dolpa_bot.py --once   (1회 실행 후 종료 — cron용)
+#        python dolpa_bot.py --test   (지금 즉시 브리핑 발송, 테스트용)
+# ============================================================================
+import os
+import sys
+import json
+import time
+import traceback
+from datetime import datetime, timedelta, date
+
+import requests
+import pandas as pd
+import numpy as np
+
+try:
+    from zoneinfo import ZoneInfo
+    _HAS_ZI = True
+except Exception:
+    _HAS_ZI = False
+
+# ============================================================================
+#  설정
+# ============================================================================
+TICKER = "SOXL"
+
+# --- 전략 파라미터 (검증된 고정값 — 함부로 바꾸지 말 것) ---
+#   파라미터 그리드·워크포워드 검증 결과 넓은 고원형이며,
+#   매년 재최적화가 고정 대비 우위 없음 → 고정 사용 권장.
+BREAKOUT_PCT = 0.015     # 트리거 = 당일시가 × (1 + 이 값)
+ATR_WINDOW   = 30
+PCTL_WINDOW  = 252
+PCTL_Q       = 0.70
+MA_WINDOW    = 30
+
+# --- 알림 시각 (미국 동부시간 기준, 서머타임 자동 반영) ---
+PREOPEN_MIN  = 30    # 개장 몇 분 전에 필터 브리핑
+POSTOPEN_MIN = 2     # 개장 몇 분 후에 시가 확정 알림
+POSTCLOSE_MIN = 30   # 마감 몇 분 후에 체결 확인
+
+MARKET_OPEN  = (9, 30)    # ET
+MARKET_CLOSE = (16, 0)    # ET
+
+TELEGRAM_TOKEN   = os.environ.get("BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("CHAT_ID", "")
+
+STATE_FILE = os.environ.get("DOLPA_STATE", "dolpa_state.json")
+
+DEFAULT_STATE = {
+    "enabled": True,          # 봇 온/오프
+    "holding": False,         # 현재 보유 중인가
+    "entry_price": None,      # 진입가 (보유중일 때)
+    "entry_date": None,       # 진입일 (미국 세션 날짜)
+    "shares": 0,              # 보유 수량
+    "budget": 0.0,            # 운용 예산 ($) — 수동 입력
+    "trades": [],             # 체결 이력 [{date, side, price, shares, pnl}]
+    "sent": {},               # 중복발송 방지 {"YYYY-MM-DD:slot": true}
+}
+
+
+# ============================================================================
+#  시간 유틸
+# ============================================================================
+def now_et():
+    if _HAS_ZI:
+        return datetime.now(ZoneInfo("America/New_York"))
+    k = datetime.utcnow() + timedelta(hours=9)
+    dst = (3 < k.month < 11) or (k.month == 3 and k.day >= 8) or (k.month == 11 and k.day < 7)
+    return k - timedelta(hours=13 if dst else 14)
+
+
+def now_kst():
+    if _HAS_ZI:
+        return datetime.now(ZoneInfo("Asia/Seoul"))
+    return datetime.utcnow() + timedelta(hours=9)
+
+
+def et_at(d, hm):
+    """해당 ET 날짜의 특정 시각(hh, mm)을 tz-aware datetime으로."""
+    base = datetime(d.year, d.month, d.day, hm[0], hm[1])
+    if _HAS_ZI:
+        return base.replace(tzinfo=ZoneInfo("America/New_York"))
+    return base
+
+
+def is_weekday(d):
+    return d.weekday() < 5
+
+
+def kst_str(dt_et):
+    """ET datetime을 KST 문자열로."""
+    if _HAS_ZI:
+        return dt_et.astimezone(ZoneInfo("Asia/Seoul")).strftime("%H:%M")
+    return (dt_et + timedelta(hours=14)).strftime("%H:%M")
+
+
+# ============================================================================
+#  상태 저장 (로컬 JSON — 필요하면 GitHub 연동으로 교체 가능)
+# ============================================================================
+def load_state():
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            s = json.load(f)
+        out = dict(DEFAULT_STATE)
+        out.update(s)
+        return out
+    except Exception:
+        return dict(DEFAULT_STATE)
+
+
+def save_state(s):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"상태 저장 실패: {e}")
+        return False
+
+
+def mark_sent(s, slot):
+    key = f"{now_et().date()}:{slot}"
+    s.setdefault("sent", {})[key] = True
+    # 오래된 기록 정리 (30일치만)
+    cutoff = str(now_et().date() - timedelta(days=30))
+    s["sent"] = {k: v for k, v in s["sent"].items() if k.split(":")[0] >= cutoff}
+    save_state(s)
+
+
+def already_sent(s, slot):
+    return s.get("sent", {}).get(f"{now_et().date()}:{slot}", False)
+
+
+# ============================================================================
+#  시세 — 일봉(지표용) / 1분봉(당일 시가용)
+# ============================================================================
+def fetch_daily():
+    """일봉 OHLC. Yahoo 차트 API 직접 호출 (yfinance 의존 없음).
+    ⚠️ 지표 계산용이므로 '전일까지' 데이터만 쓴다. 당일 봉이 섞여 들어와도
+       filter_verdict()에서 전일 인덱스를 명시적으로 잡아 사용한다."""
+    for attempt in range(3):
+        try:
+            url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{TICKER}"
+                   f"?range=3y&interval=1d")
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            ts = res["timestamp"]
+            q = res["indicators"]["quote"][0]
+            df = pd.DataFrame({
+                "Open": q["open"], "High": q["high"],
+                "Low": q["low"], "Close": q["close"],
+            }, index=pd.to_datetime(ts, unit="s"))
+            df.index = pd.DatetimeIndex(df.index).tz_localize(None).normalize()
+            df = df.dropna()
+            if len(df) > 300:
+                return df
+        except Exception as e:
+            print(f"일봉 수신 실패({attempt+1}/3): {e}")
+            time.sleep(2)
+    return None
+
+
+def fetch_today_open():
+    """당일 시가. 1분봉 첫 봉의 Open을 쓴다.
+    시가는 09:30:00에 확정되고 이후 변하지 않으므로, 개장 직후 언제 불러도 동일하다.
+    반환: (세션날짜, 시가, 현재가) 또는 None"""
+    for attempt in range(3):
+        try:
+            url = (f"https://query1.finance.yahoo.com/v8/finance/chart/{TICKER}"
+                   f"?range=1d&interval=1m")
+            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)
+            r.raise_for_status()
+            res = r.json()["chart"]["result"][0]
+            meta = res.get("meta", {})
+            ts = res["timestamp"]
+            q = res["indicators"]["quote"][0]
+            opens = [x for x in q["open"] if x is not None]
+            if not opens:
+                raise ValueError("빈 1분봉")
+            first_open = float(opens[0])
+            last_price = float(meta.get("regularMarketPrice") or opens[-1])
+            sess_date = pd.to_datetime(ts[0], unit="s").date()
+            # 장중 고가 (트리거 도달 여부 확인용)
+            highs = [x for x in q["high"] if x is not None]
+            day_high = float(max(highs)) if highs else last_price
+            return {"date": sess_date, "open": first_open,
+                    "price": last_price, "high": day_high}
+        except Exception as e:
+            print(f"시가 수신 실패({attempt+1}/3): {e}")
+            time.sleep(2)
+    return None
+
+
+# ============================================================================
+#  필터 판정 — 전일 데이터만으로 확정된다 (시가와 무관)
+# ============================================================================
+def compute_indicators(df):
+    d = df.copy()
+    prev_close = d["Close"].shift(1)
+    tr = pd.concat([
+        d["High"] - d["Low"],
+        (d["High"] - prev_close).abs(),
+        (d["Low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    d["ATR"] = tr.rolling(ATR_WINDOW).mean()
+    d["ATR_pct"] = d["ATR"] / d["Close"] * 100.0
+    d["ATR_p70"] = d["ATR_pct"].shift(1).rolling(PCTL_WINDOW).quantile(PCTL_Q)
+    d["MA"] = d["Close"].rolling(MA_WINDOW).mean()
+    return d
+
+
+def filter_verdict(df, session_date=None):
+    """오늘 매수를 스킵해야 하는지 판정.
+    session_date: 판정 대상 세션(오늘). 지정하면 그 이전 마지막 봉을 '전일'로 쓴다.
+    반환 dict: skip(bool), atr_pct, p70, close, ma, 사유"""
+    d = compute_indicators(df)
+    if session_date is not None:
+        d = d[d.index.date < session_date]
+    if len(d) < 2:
+        return None
+    row = d.iloc[-1]          # 전일 봉
+    prev_date = d.index[-1].date()
+
+    atr_pct = row["ATR_pct"]
+    p70 = row["ATR_p70"]
+    close = row["Close"]
+    ma = row["MA"]
+    if pd.isna(atr_pct) or pd.isna(p70) or pd.isna(ma):
+        return {"skip": True, "prev_date": prev_date, "reason": "지표 워밍업 부족",
+                "atr_pct": None, "p70": None, "close": close, "ma": None,
+                "cond_vol": None, "cond_trend": None}
+
+    cond_vol = bool(atr_pct >= p70)      # 변동성이 최근 1년 상위 30%
+    cond_trend = bool(close < ma)        # 추세가 MA30 아래
+    skip = cond_vol and cond_trend
+
+    return {"skip": skip, "prev_date": prev_date,
+            "atr_pct": float(atr_pct), "p70": float(p70),
+            "close": float(close), "ma": float(ma),
+            "cond_vol": cond_vol, "cond_trend": cond_trend,
+            "reason": ("고변동 + 추세이탈" if skip else "정상")}
+
+
+# ============================================================================
+#  텔레그램
+# ============================================================================
+MENU_KEYBOARD = {
+    "inline_keyboard": [
+        [{"text": "📊 상태", "callback_data": "status"},
+         {"text": "📦 보유", "callback_data": "position"}],
+        [{"text": "✅ 매수 체결", "callback_data": "fill_buy"},
+         {"text": "💰 매도 체결", "callback_data": "fill_sell"}],
+        [{"text": "📜 거래내역", "callback_data": "history"},
+         {"text": "⏯ 봇 온/오프", "callback_data": "toggle"}],
+    ]
+}
+
+
+def tg_send(text, keyboard=None, chat_id=None):
+    if not TELEGRAM_TOKEN or not (chat_id or TELEGRAM_CHAT_ID):
+        print("⚠️ BOT_TOKEN/CHAT_ID 미설정 — 콘솔 출력으로 대체\n" + text)
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id or TELEGRAM_CHAT_ID, "text": text,
+               "parse_mode": "Markdown"}
+    if keyboard:
+        payload["reply_markup"] = json.dumps(keyboard)
+    try:
+        r = requests.post(url, json=payload, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"🚨 텔레그램 전송 실패: {e}")
+        return None
+
+
+def tg_answer_callback(cb_id, text=""):
+    if not TELEGRAM_TOKEN:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": cb_id, "text": text}, timeout=10)
+    except Exception:
+        pass
+
+
+def tg_get_updates(offset=None, timeout=25):
+    if not TELEGRAM_TOKEN:
+        return []
+    try:
+        params = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+        r = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                         params=params, timeout=timeout + 10)
+        r.raise_for_status()
+        return r.json().get("result", [])
+    except Exception:
+        return []
+
+
+# ============================================================================
+#  메시지 빌더
+# ============================================================================
+def fmt_money(v):
+    return f"${v:,.2f}" if v is not None else "—"
+
+
+def msg_header(state):
+    on = "▶️ 가동중" if state.get("enabled") else "⏸ 정지중"
+    pos = "🟠 보유중" if state.get("holding") else "🟢 현금"
+    return (f"📈 *돌파공 (SOXL 돌파+ATR필터)*\n"
+            f"{on}  ·  {pos}\n"
+            f"━━━━━━━━━━━━━━━━━━")
+
+
+def msg_schedule():
+    et = now_et()
+    d = et.date()
+    o = et_at(d, MARKET_OPEN)
+    c = et_at(d, MARKET_CLOSE)
+    return (f"🗓 *오늘 스케줄 (KST)*\n"
+            f"🔔 필터 브리핑  {kst_str(o - timedelta(minutes=PREOPEN_MIN))}\n"
+            f"🌅 시가 확정·주문  {kst_str(o + timedelta(minutes=POSTOPEN_MIN))}\n"
+            f"🌙 체결 확인  {kst_str(c + timedelta(minutes=POSTCLOSE_MIN))}")
+
+
+def msg_preopen(state, v):
+    """① 개장 30분 전 — 필터 판정."""
+    et = now_et()
+    o = et_at(et.date(), MARKET_OPEN)
+    lines = [msg_header(state), ""]
+
+    if v is None:
+        lines.append("⚠️ 지표 계산 실패 — 데이터 수신을 확인하세요.")
+        return "\n".join(lines)
+
+    if v["skip"]:
+        lines += [
+            "🚨 *오늘은 매매 정지 (필터 발동)*",
+            "",
+            "전일 기준 두 조건이 동시에 성립했습니다:",
+            f"  • ATR30% *{v['atr_pct']:.2f}%* ≥ 1년 70%분위 *{v['p70']:.2f}%*  (고변동)",
+            f"  • 전일종가 *{fmt_money(v['close'])}* < MA30 *{fmt_money(v['ma'])}*  (추세이탈)",
+            "",
+            "→ *신규 매수 없음.* 개장 시각에 깨어 있을 필요 없습니다.",
+        ]
+    else:
+        why = []
+        if not v["cond_vol"]:
+            why.append(f"변동성 정상 (ATR30% {v['atr_pct']:.2f}% < {v['p70']:.2f}%)")
+        if not v["cond_trend"]:
+            why.append(f"추세 유지 (종가 {fmt_money(v['close'])} ≥ MA30 {fmt_money(v['ma'])})")
+        lines += [
+            "⚡ *오늘 매매 대기 (필터 통과)*",
+            "",
+            "  • " + "\n  • ".join(why),
+            "",
+            f"개장 *{kst_str(o)} KST* 직후 시가가 확정되면",
+            f"트리거가(시가 × {1+BREAKOUT_PCT:.3f})를 계산해 다시 보냅니다.",
+        ]
+
+    if state.get("holding"):
+        ep = state.get("entry_price")
+        lines += ["", "━━━━━━━━━━━━━━━━━━",
+                  f"📦 *보유 포지션* — {state.get('shares', 0)}주 @ {fmt_money(ep)}",
+                  f"→ 오늘 *개장 시가에 전량 매도* 하세요."]
+
+    lines += ["", msg_schedule()]
+    return "\n".join(lines)
+
+
+def msg_open(state, v, tick):
+    """② 개장 +2분 — 시가 확정, 트리거가 안내."""
+    lines = [msg_header(state), ""]
+    op = tick["open"]
+    cur = tick["price"]
+
+    # 매도가 먼저
+    if state.get("holding"):
+        ep = state.get("entry_price") or 0
+        sh = state.get("shares", 0)
+        pnl = (op - ep) * sh if ep else 0
+        pnl_pct = ((op / ep - 1) * 100) if ep else 0
+        lines += [
+            "🔴 *[매도] 지금 시가에 전량 청산*",
+            f"  • {sh}주 · 시가 *{fmt_money(op)}*",
+            f"  • 진입가 {fmt_money(ep)} → 손익 *{pnl:+,.2f}* ({pnl_pct:+.2f}%)",
+            "",
+        ]
+
+    if v and v["skip"]:
+        lines += ["🚨 *신규 매수 없음* — 필터 발동일입니다.", ""]
+    else:
+        trig = op * (1 + BREAKOUT_PCT)
+        budget = state.get("budget", 0.0)
+        qty = int(budget / trig) if (budget and trig > 0) else 0
+        hit = tick["high"] >= trig
+        lines += [
+            f"🔵 *[매수] 트리거 {fmt_money(trig)}*",
+            f"  • 당일시가 {fmt_money(op)} × {1+BREAKOUT_PCT:.3f}",
+            f"  • 현재가 {fmt_money(cur)}"
+            + (f"  ⚠️ *이미 트리거 돌파*" if hit else ""),
+        ]
+        if qty:
+            lines.append(f"  • 예산 {fmt_money(budget)} 기준 약 *{qty}주*")
+        lines += [
+            "",
+            ("⚠️ 이미 트리거를 넘겼습니다. 지금 진입하면 백테스트 가정보다\n"
+             "   불리한 가격입니다 — 추격 여부는 직접 판단하세요."
+             if hit else
+             f"→ *{fmt_money(trig)} 이상으로 올라가면* 그 가격 근처에서 매수.\n"
+             f"   장중 도달하지 않으면 오늘은 진입 없음."),
+        ]
+
+    lines += ["", "━━━━━━━━━━━━━━━━━━",
+              "체결하셨으면 아래 버튼으로 알려주세요."]
+    return "\n".join(lines)
+
+
+def msg_postclose(state, tick):
+    """③ 마감 후 — 체결 확인 요청."""
+    lines = [msg_header(state), "", "🌙 *장 마감 — 체결 확인*", ""]
+    if tick:
+        lines.append(f"오늘 종가 *{fmt_money(tick['price'])}* "
+                     f"(시가 {fmt_money(tick['open'])} / 고가 {fmt_money(tick['high'])})")
+        lines.append("")
+    if state.get("holding"):
+        lines += [f"현재 상태: *보유중* {state.get('shares',0)}주 "
+                  f"@ {fmt_money(state.get('entry_price'))}",
+                  "",
+                  "내일 시가에 청산 예정입니다."]
+    else:
+        lines += ["현재 상태: *현금*", "",
+                  "매수 체결하셨다면 '✅ 매수 체결' 버튼을 눌러주세요."]
+    return "\n".join(lines)
+
+
+def msg_status(state, df=None):
+    lines = [msg_header(state), ""]
+    v = None
+    if df is not None:
+        v = filter_verdict(df, session_date=now_et().date())
+    if v:
+        tag = "🚨 매매정지" if v["skip"] else "⚡ 매매대기"
+        lines += [f"오늘 판정: *{tag}*",
+                  f"  • ATR30% {v['atr_pct']:.2f}% / 기준 {v['p70']:.2f}%"
+                  if v['atr_pct'] else "  • 지표 부족",
+                  f"  • 종가 {fmt_money(v['close'])} / MA30 {fmt_money(v['ma'])}",
+                  ""]
+    lines += [f"💰 예산 {fmt_money(state.get('budget'))}",
+              f"📦 보유 {'있음' if state.get('holding') else '없음'}"]
+    if state.get("holding"):
+        lines.append(f"   {state.get('shares',0)}주 @ {fmt_money(state.get('entry_price'))} "
+                     f"({state.get('entry_date')})")
+    tr = state.get("trades", [])
+    if tr:
+        realized = sum(t.get("pnl", 0) or 0 for t in tr if t.get("side") == "SELL")
+        lines += ["", f"📊 누적 실현손익 *{realized:+,.2f}* ({len(tr)}건)"]
+    lines += ["", msg_schedule()]
+    return "\n".join(lines)
+
+
+def msg_history(state, n=10):
+    tr = state.get("trades", [])
+    if not tr:
+        return "📜 거래 내역이 없습니다."
+    lines = ["📜 *최근 거래내역*", ""]
+    for t in tr[-n:][::-1]:
+        if t["side"] == "BUY":
+            lines.append(f"🔵 {t['date']} 매수 {t['shares']}주 @ {fmt_money(t['price'])}")
+        else:
+            lines.append(f"🔴 {t['date']} 매도 {t['shares']}주 @ {fmt_money(t['price'])} "
+                         f"({t.get('pnl', 0):+,.2f})")
+    realized = sum(t.get("pnl", 0) or 0 for t in tr if t.get("side") == "SELL")
+    lines += ["", f"누적 실현손익 *{realized:+,.2f}*"]
+    return "\n".join(lines)
+
+
+# ============================================================================
+#  버튼 핸들러
+# ============================================================================
+def handle_callback(data, state, df, tick_cache):
+    """반환: (응답 텍스트, 키보드 표시 여부)"""
+    if data == "status":
+        return msg_status(state, df), True
+
+    if data == "position":
+        if not state.get("holding"):
+            return "📦 보유 포지션이 없습니다. (현금 상태)", True
+        ep = state.get("entry_price") or 0
+        sh = state.get("shares", 0)
+        t = tick_cache.get("tick")
+        cur = t["price"] if t else None
+        lines = ["📦 *보유 포지션*", "",
+                 f"  {sh}주 @ {fmt_money(ep)}",
+                 f"  진입일 {state.get('entry_date')}"]
+        if cur:
+            pnl = (cur - ep) * sh
+            lines += [f"  현재가 {fmt_money(cur)}",
+                      f"  평가손익 *{pnl:+,.2f}* ({(cur/ep-1)*100:+.2f}%)"]
+        lines += ["", "→ 다음 개장 시가에 전량 청산합니다."]
+        return "\n".join(lines), True
+
+    if data == "fill_buy":
+        if state.get("holding"):
+            return "⚠️ 이미 보유 중으로 기록돼 있습니다. 먼저 매도를 기록하세요.", True
+        t = tick_cache.get("tick") or fetch_today_open()
+        if not t:
+            return "⚠️ 시세를 받지 못했습니다. 잠시 후 다시 시도하세요.", True
+        trig = t["open"] * (1 + BREAKOUT_PCT)
+        budget = state.get("budget", 0.0)
+        qty = int(budget / trig) if (budget and trig > 0) else 0
+        state["holding"] = True
+        state["entry_price"] = round(trig, 2)
+        state["entry_date"] = str(t["date"])
+        state["shares"] = qty
+        state.setdefault("trades", []).append({
+            "date": str(t["date"]), "side": "BUY",
+            "price": round(trig, 2), "shares": qty, "pnl": None})
+        save_state(state)
+        return (f"✅ *매수 체결 기록*\n\n"
+                f"  {qty}주 @ {fmt_money(trig)}\n"
+                f"  ({t['date']})\n\n"
+                f"수량·단가가 실제와 다르면 `/set` 으로 정정하세요.\n"
+                f"예: `/set shares 34`  ·  `/set price 41.25`"), True
+
+    if data == "fill_sell":
+        if not state.get("holding"):
+            return "⚠️ 보유 포지션이 없습니다.", True
+        t = tick_cache.get("tick") or fetch_today_open()
+        px = t["open"] if t else state.get("entry_price")
+        ep = state.get("entry_price") or 0
+        sh = state.get("shares", 0)
+        pnl = (px - ep) * sh
+        state.setdefault("trades", []).append({
+            "date": str(t["date"]) if t else str(now_et().date()), "side": "SELL",
+            "price": round(px, 2), "shares": sh, "pnl": round(pnl, 2)})
+        state["holding"] = False
+        state["entry_price"] = None
+        state["entry_date"] = None
+        state["shares"] = 0
+        save_state(state)
+        return (f"💰 *매도 체결 기록*\n\n"
+                f"  {sh}주 @ {fmt_money(px)}\n"
+                f"  손익 *{pnl:+,.2f}*\n\n"
+                f"현금 상태로 전환했습니다."), True
+
+    if data == "history":
+        return msg_history(state), True
+
+    if data == "toggle":
+        state["enabled"] = not state.get("enabled", True)
+        save_state(state)
+        return ("▶️ 봇을 *가동*했습니다. 정규 알림을 다시 보냅니다."
+                if state["enabled"] else
+                "⏸ 봇을 *정지*했습니다. 정규 알림을 보내지 않습니다.\n"
+                "(버튼 조회는 계속 됩니다)"), True
+
+    return "알 수 없는 명령입니다.", True
+
+
+def handle_command(text, state, df, tick_cache):
+    t = text.strip()
+    low = t.lower()
+
+    if low in ("/start", "/menu", "메뉴"):
+        return msg_status(state, df), True
+    if low == "/status" or low == "상태":
+        return msg_status(state, df), True
+    if low == "/history":
+        return msg_history(state), True
+    if low.startswith("/budget"):
+        parts = t.split()
+        if len(parts) >= 2:
+            try:
+                state["budget"] = float(parts[1].replace(",", "").replace("$", ""))
+                save_state(state)
+                return f"💰 예산을 *{fmt_money(state['budget'])}* 로 설정했습니다.", True
+            except ValueError:
+                pass
+        return f"현재 예산: *{fmt_money(state.get('budget'))}*\n사용법: `/budget 5000`", True
+    if low.startswith("/set"):
+        parts = t.split()
+        if len(parts) >= 3:
+            k, val = parts[1].lower(), parts[2]
+            try:
+                if k == "shares":
+                    state["shares"] = int(val)
+                elif k == "price":
+                    state["entry_price"] = float(val)
+                else:
+                    return "설정 가능: `shares`, `price`", True
+                save_state(state)
+                return (f"✏️ 수정 완료 — {state.get('shares',0)}주 @ "
+                        f"{fmt_money(state.get('entry_price'))}"), True
+            except ValueError:
+                return "숫자 형식이 올바르지 않습니다.", True
+        return "사용법: `/set shares 34` 또는 `/set price 41.25`", True
+    if low == "/help":
+        return ("💡 *명령어*\n\n"
+                "`/status` 현재 상태·오늘 판정\n"
+                "`/budget 5000` 운용 예산 설정\n"
+                "`/set shares 34` 보유 수량 정정\n"
+                "`/set price 41.25` 진입가 정정\n"
+                "`/history` 거래 내역\n\n"
+                "체결 기록은 아래 버튼을 쓰세요."), True
+
+    return None, False
+
+
+# ============================================================================
+#  정규 발송
+# ============================================================================
+def run_scheduled(state, force_slot=None):
+    """시각을 보고 해당하는 알림을 발송. force_slot으로 강제 실행 가능."""
+    et = now_et()
+    d = et.date()
+    if not is_weekday(d) and not force_slot:
+        return
+
+    o = et_at(d, MARKET_OPEN)
+    c = et_at(d, MARKET_CLOSE)
+    pre = o - timedelta(minutes=PREOPEN_MIN)
+    post = o + timedelta(minutes=POSTOPEN_MIN)
+    after = c + timedelta(minutes=POSTCLOSE_MIN)
+
+    def within(target, window_min=8):
+        return target <= et < target + timedelta(minutes=window_min)
+
+    slot = force_slot
+    if slot is None:
+        if within(pre):
+            slot = "preopen"
+        elif within(post):
+            slot = "open"
+        elif within(after):
+            slot = "postclose"
+    if slot is None:
+        return
+    if already_sent(state, slot) and not force_slot:
+        return
+    if not state.get("enabled") and not force_slot:
+        return
+
+    df = fetch_daily()
+    if df is None:
+        tg_send("⚠️ *돌파공* — 시세 수신 실패\n일봉 데이터를 받지 못했습니다. "
+                "잠시 후 자동 재시도합니다.")
+        return
+    v = filter_verdict(df, session_date=d)
+
+    if slot == "preopen":
+        tg_send(msg_preopen(state, v), MENU_KEYBOARD)
+        mark_sent(state, slot)
+
+    elif slot == "open":
+        # 스킵일이고 보유도 없으면 보낼 내용이 없다
+        if v and v["skip"] and not state.get("holding"):
+            mark_sent(state, slot)
+            return
+        tick = fetch_today_open()
+        if not tick:
+            tg_send("⚠️ *돌파공* — 당일 시가를 받지 못했습니다.\n"
+                    "직접 확인 후 수동 판단하세요.", MENU_KEYBOARD)
+            return
+        tg_send(msg_open(state, v, tick), MENU_KEYBOARD)
+        mark_sent(state, slot)
+
+    elif slot == "postclose":
+        tick = fetch_today_open()
+        tg_send(msg_postclose(state, tick), MENU_KEYBOARD)
+        mark_sent(state, slot)
+
+
+# ============================================================================
+#  메인 루프 (스케줄 + 버튼 폴링 동시)
+# ============================================================================
+def main_loop():
+    state = load_state()
+    tick_cache = {"tick": None, "at": None}
+    df_cache = {"df": None, "at": None}
+    offset = None
+
+    print("📈 돌파공 봇 시작 — 스케줄 + 버튼 폴링")
+    tg_send(msg_header(state) + "\n\n봇을 시작했습니다.", MENU_KEYBOARD)
+
+    while True:
+        try:
+            state = load_state()
+
+            # 1) 정규 스케줄 확인
+            run_scheduled(state)
+
+            # 2) 캐시 갱신 (일봉 6시간 / 틱 3분)
+            now = time.time()
+            if df_cache["at"] is None or now - df_cache["at"] > 21600:
+                d = fetch_daily()
+                if d is not None:
+                    df_cache["df"] = d
+                    df_cache["at"] = now
+            if tick_cache["at"] is None or now - tick_cache["at"] > 180:
+                t = fetch_today_open()
+                if t:
+                    tick_cache["tick"] = t
+                    tick_cache["at"] = now
+
+            # 3) 버튼·명령 폴링
+            for upd in tg_get_updates(offset, timeout=20):
+                offset = upd["update_id"] + 1
+                state = load_state()
+
+                if "callback_query" in upd:
+                    cb = upd["callback_query"]
+                    text, kb = handle_callback(cb.get("data", ""), state,
+                                                df_cache["df"], tick_cache)
+                    tg_answer_callback(cb["id"])
+                    tg_send(text, MENU_KEYBOARD if kb else None,
+                            chat_id=cb["message"]["chat"]["id"])
+
+                elif "message" in upd and "text" in upd["message"]:
+                    m = upd["message"]
+                    text, kb = handle_command(m["text"], state,
+                                               df_cache["df"], tick_cache)
+                    if text:
+                        tg_send(text, MENU_KEYBOARD if kb else None,
+                                chat_id=m["chat"]["id"])
+
+        except KeyboardInterrupt:
+            print("종료합니다.")
+            break
+        except Exception as e:
+            print(f"🚨 루프 오류: {e}")
+            traceback.print_exc()
+            time.sleep(30)
+
+
+if __name__ == "__main__":
+    args = sys.argv[1:]
+    if "--test" in args:
+        s = load_state()
+        slot = "preopen"
+        for a in args:
+            if a in ("preopen", "open", "postclose"):
+                slot = a
+        print(f"테스트 발송: {slot}")
+        run_scheduled(s, force_slot=slot)
+    elif "--once" in args:
+        s = load_state()
+        run_scheduled(s)
+    else:
+        main_loop()
